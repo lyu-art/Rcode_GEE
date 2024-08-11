@@ -1,0 +1,649 @@
+
+library(tmvtnorm)
+library(mvtnorm)
+library(MASS)
+library(survival)
+library(pbivnorm)
+library(optimr)
+library(numDeriv)
+library(nloptr)
+library(matrixcalc)
+library(ROOPSD)
+library(locpol)
+library(truncnorm)
+
+library(quantreg)
+
+########################################################################################### 
+##M (covariate for survival time) and W (covariates for censoring time) include column 1. Timis is the ##survival time, Delta=1 when survival time is observed, Zeta=1 when censoring time is observed.
+############################################################################################
+## the main function is used to analyze the data. 
+  
+result <- main(time, Delta, Zeta, M, W)
+
+
+###------------------------------------------------------------------------------------------------
+### The following are supporting functions
+###----------------------------------------------------------------------------------------------
+
+main <- function(time, Delta, Zeta, M, W){
+Y <- time
+datause <- cbind(time, Delta, Zeta, M, W)
+init1 <- lss(cbind(Y,Delta)~M[,-1])
+init2 <- lss(cbind(Y,Zeta)~W[,-1])
+n <- length(time)
+bw<-n^(-1/5)
+maxstep <- 50
+
+initall <- c(init1$ybar, init1$beta, init2$ybar, init2$beta, 1,1,0.5)
+
+init <- initall
+initial <- initall
+ncov <- length(initall)
+nM <- dim(M)[2]
+nW <- dim(W)[2]
+
+  ### Fitting GEE method
+  parhat2 <- GEEdep(initall, initall[-((ncov-2):(ncov-1))], Y, Delta,Zeta, M, W, bw, maxstep)
+  parhatGEE <- parhat2$parnew
+  sdY <- parhat2$sdF1
+  sdC <- parhat2$sdF2
+  sdYobs <- parhat2$sdF1obs
+  sdCobs <- parhat2$sdF2obs
+  muY <- M%*% parhatGEE[1:7]
+  muC <- W%*%parhatGEE[8:14]
+  print('parhatGEE')
+  print(parhatGEE)
+
+################
+  ### bootstrap
+  nboot <- 2
+  A.boot <- matrix(0,nrow=nboot,ncol=ncov-2)
+  for(ii in 1:nboot){
+    print('boot')
+    print(ii)
+    seed<-10*ii+6
+    position<-floor(runif(n,0,1)*n)+1	
+    newdata<-datause[position,]
+###
+    parhat2.boot<-GEEdep(initall, initall[-((ncov-2):(ncov-1))], newdata[,1],newdata[,2],newdata[,3],newdata[,4:(4+nM-1)],newdata[,(4+nM):(4+nM+nW-1)],bw, maxstep)
+    A.boot[ii,]<-c(parhat2.boot$parnew)
+}
+  
+  B.boot<-sqrt(apply(A.boot,2,var))
+object <- list(parhatGEE=parhatGEE, B.boot=B.boot)
+object
+}
+
+
+RankRegEF <- function(y, d, x, beta, type="Gehan") {
+  n <- length(y)                   ## dimension of x must be n x q.
+  x <- as.matrix(x)                ## x must NOT including intercept.
+  xdim <- dim(x)
+  if( xdim[1] != n ) stop("check dim of x")
+  if( length(beta) != xdim[2] ) stop("check dim of beta and x")
+  if(any((d!=0)&(d!=1)))     stop("d must be 0(right-censored) or 1(uncensored)")
+  if(length(d) != n) stop("check the length of d")
+  
+  e <- y - as.vector( x %*% beta )
+  ordere <- order(e, -d)
+  esort <- e[ordere]
+  dsort <- d[ordere]
+  xsort <- as.matrix(x[ordere,])
+  dsort[length(dsort)] <- 1   #last one as uncensored always
+  
+  ##xbar <- rev(cumsum(rev(xsort)))/(n:1)  #for 1 dim
+  
+  xbar <- xsort
+  ####for(j in 1:(n-1)) xbar[j,] <- colMeans(xsort[j:n,])
+  for(j in 1:xdim[2]) xbar[,j] <- rev(cumsum(rev(xsort[,j])))/(n:1)
+  
+  if(type == "Gehan") {A <- (n:1) * (xsort - xbar)}
+  else {if(type == "Logrank") A <- (xsort - xbar) 
+  else stop("type must be either Gehan or Logrank") }
+  A <- dsort*A
+  
+  rootnV <- sqrt(n) * colMeans(A)
+  return(rootnV)
+}
+RankRegV <- function(y, d, x, beta, betanull=beta, type="Gehan") { 
+  n <- length(y)                    ## dimension of x must be n x q.
+  x <- as.matrix(x)                 ## x must NOT including intercept.
+  xdim <- dim(x)
+  if ( xdim[1] != n ) stop("check dim of x")
+  if ( length(beta) != xdim[2] ) stop("check dim of beta and x")
+  if ( length(betanull) != xdim[2] ) stop("check dim of betanull")
+  if(any((d!=0)&(d!=1)))
+    stop("d must be 0(right-censored) or 1(uncensored)")
+  if (length(d) != n) stop("check the length of d")
+  
+  e <- y - as.vector( x %*% beta )
+  ordere <- order(e, -d)
+  esort <- e[ordere]
+  dsort <- d[ordere]
+  xsort <- as.matrix(x[ordere,])
+  dsort[length(dsort)] <- 1       #last one as uncensored always
+  
+  ##xbar <- rev(cumsum(rev(xsort)))/(n:1)  #for 1 dim
+  
+  xbar <- xsort
+  ####for(j in 1:(n-1)) xbar[j,] <- colMeans(xsort[j:n,])
+  for(j in 1:xdim[2]) xbar[,j] <- rev(cumsum(rev(xsort[,j])))/(n:1)
+  
+  if(type == "Gehan") {A <- (n:1) * (xsort - xbar)}
+  else {if(type == "Logrank") A <- (xsort - xbar)
+  else stop("type must be either Gehan or Logrank") }
+  A <- dsort*A
+  
+  Vtest <- array(0, c(xdim[2],xdim[2],n))
+  for(i in 1:n) Vtest[,,i] <- crossprod(t(A[i,]))
+  
+  VtestF <- t(colSums(aperm(Vtest)))/n
+  vv <- RankRegEF(y=y, d=d, x=x, beta=betanull, type=type)
+  chisqvalue <- t(vv) %*% solve(VtestF, vv)
+  Pval <- 1 - pchisq(chisqvalue, df=xdim[2]) 
+  list(VEF=VtestF, chisquare=chisqvalue, Pval=Pval)
+}
+
+aft.fun<-function(x,y,delta,randomseed=10,weight="logrank",nstep=3, mcsize=1) 
+{
+  if(any((delta!=0)&(delta!=1)))
+    stop("delta must be 0(right-censored) or 1(uncensored)")  
+  set.seed(randomseed)   #set seed for random number generator 
+  ynew<-1000*(length(y))^2 
+  data1<-data.frame(y,x)  
+  options(contrasts=c("contr.treatment","contr.poly")) 
+  tempfit<-lm(y~.,x=TRUE,y=TRUE,data=data1) 
+  x<-as.matrix(tempfit$x[,-1]) 
+  xn<-dimnames(x)[[2]] 
+  y<-tempfit$y 
+  dimnum<-dim(x) # dimnum[1]=number of observation      
+  # dimnum[2]=number of covariates, excluding intercept 
+  n1<-dimnum[1] 
+  n2<-dimnum[2] 
+  betagw<-betagc<-matrix(0, nrow=mcsize,ncol=n2) 
+  if(weight=="logrank"){
+    nst<-nstep 
+  }   else {nst<-0}  
+  betagm<-betalw<-array(0, dim=c(n2,mcsize)) 
+  betagc<-betalc<-array(0, dim=c(n2,mcsize)) 
+  covw<-array(0, dim=c(n2,n2, nst+1)) 
+  residuals<-matrix(0, nrow=n1,ncol=nst+1)  
+  
+  yy0<-rep(y,rep(n1,n1)) 
+  delta1<-rep(delta,rep(n1,n1)) 
+  yy1<-rep(y,n1) 
+  yy<-delta1*(yy0-yy1) 
+  xx0<-matrix(rep(as.vector(x),rep(n1,n1*n2)),nrow=n1*n1) 
+  xx1<-t(matrix(rep(as.vector(t(x)),n1),nrow=n2))
+  xx<-xx0-xx1   #difference of xx0-xx1 
+  xxdif<-xx*delta1 #difference of xx0-xx1 multiplying censoring indicator 
+  xnew<-apply(xxdif,2,sum) 
+  xnew<-rbind(xxdif,-xnew) 
+  yynew<-c(yy,ynew) 
+  dimnames(xnew)<-list(NULL,xn) 
+  
+  fit<-rq.fit(xnew,yynew, tau=0.5) 
+  betag<-fit$coef 
+  residn<-fit$resid 
+  residn<-(!(residn>0)) 
+  residn<-residn[-(length(residn))] 
+  betal<-betag 
+  if (weight=="logrank"){
+    for (i in 1:nstep){
+      fitted<-x%*%betal    
+      eb<-y-fitted
+      ss0b<-(n1+1-rank(eb))/n1
+      ss0b1<-rep(ss0b,rep(n1,n1))
+      xxdifl<-xxdif/ss0b1      
+      xnewl<-apply(xxdifl,2,sum)
+      xnewl<-rbind(xxdifl,-xnewl)
+      yyl<-c(yy/ss0b1,ynew)
+      fitl<-rq.fit(xnewl,yyl, tau=0.5)
+      betal<-fitl$coef    }  }    
+  zi<-matrix(rexp(n1*mcsize),nrow=mcsize,ncol=n1) 
+  for(i in 1:mcsize) {
+    zzi<-rep(as.vector(zi[i,]),rep(n1,n1))      
+    xm<-xxdif*zzi
+    xmnew<-apply(xm,2,sum)
+    xmnew<-rbind(xm,-xmnew)
+    ymnew<-c(yy*zzi,ynew)       
+    fitm<-rq.fit(xmnew,ymnew,tau=0.5)
+    betagm[,i]<-fitm$coef
+    betalw[,i]<-betagm[,i]
+    betagc[,i]<-betagm[,i]-betag
+    if (weight=="logrank"){
+      for (j in 1:nstep){
+        fitted<-x%*%betalw[,i]
+        eb<-y-fitted
+        ss0b<-(n1+1-rank(eb))/n1
+        ss0b1<-rep(ss0b,rep(n1,n1))         
+        xxdifl<-xm/ss0b1
+        xnewl<-apply(xxdifl,2,sum)
+        xnewl<-rbind(xxdifl,-xnewl)             
+        yyl<-c(zzi*yy/ss0b1,ynew)
+        fitml<-rq.fit(xnewl,yyl,tau=0.5)
+        betalw[,i]<-fitml$coef                  }
+      betalc[,i]<-betalw[,i]-betal      }    }  
+  
+  predmatrix<-x-t(matrix(rep(apply(x,2,mean),n1),ncol=n1))  
+  covw[,,1]<-(betagc)%*%t(betagc)/mcsize  
+  residuals[,1]<-y-predmatrix%*%as.matrix(betag)  
+  covw[,,2]<-(betalc)%*%t(betalc)/mcsize  
+  residuals[,2]<-y-predmatrix%*%as.matrix(betal) 
+  object<-list(beta=rbind(betag,betal),betacov=covw,residuals=residuals,                             betagm=betagm,betalw=betalw,
+               mcsize=mcsize,message=fit$message,warning=fit$warning,                        weight=weight) 
+  class(object)<-"AFT" 
+  object
+}
+
+
+
+rankaft <- function(x,y,delta) { 
+  ynew<-1000*(length(y))^2 
+  data1<-data.frame(y,x) 
+  options(contrasts=c("contr.treatment","contr.poly")) 
+  tempfit<-lm(y~.,x=TRUE,y=TRUE,data=data1) 
+  x<-as.matrix(tempfit$x[,-1]) 
+  xn<-dimnames(x)[[2]] 
+  y<-tempfit$y 
+  dimnum<-dim(x) # dimnum[1]=number of observation 
+  # dimnum[2]=number of covariates, excluding intercept 
+  n1<-dimnum[1] 
+  n2<-dimnum[2]   
+  
+  residuals<-matrix(0, nrow=n1,ncol=3+1)  
+  
+  yy0<-rep(y,rep(n1,n1)) 
+  delta1<-rep(delta,rep(n1,n1)) 
+  yy1<-rep(y,n1) 
+  yy<-delta1*(yy0-yy1) 
+  xx0<-matrix(rep(as.vector(x),rep(n1,n1*n2)),nrow=n1*n1) 
+  xx1<-t(matrix(rep(as.vector(t(x)),n1),nrow=n2)) 
+  xx<-xx0-xx1   #difference of xx0-xx1 
+  xxdif<-xx*delta1 #difference of xx0-xx1 multiplying censoring indicator 
+  xnew<-apply(xxdif,2,sum) 
+  xnew<-rbind(xxdif,-xnew) 
+  yynew<-c(yy,ynew) 
+  dimnames(xnew)<-list(NULL,xn) 
+  
+  fit<- rq(yynew ~ xnew -1, method="fn") 
+  betag<-fit$coef 
+  residn<-fit$resid 
+  residn<-(!(residn>0))
+  residn<-residn[-(length(residn))] 
+  betal<-betag
+  for (i in 1:3){
+    fitted<-x%*%betal
+    eb<-y-fitted          
+    ss0b<-(n1+1-rank(eb))/n1
+    ss0b1<-rep(ss0b,rep(n1,n1))
+    xxdifl<-xxdif/ss0b1
+    xnewl<-apply(xxdifl,2,sum) 
+    xnewl<-rbind(xxdifl,-xnewl)
+    yyl<-c(yy/ss0b1,ynew)
+    fitl<- rq(yyl ~ xnewl - 1, method="fn")
+    betal<-fitl$coef    }  
+  predmatrix<-x-t(matrix(rep(apply(x,2,mean),n1),ncol=n1))  
+  residuals[,1]<-y-predmatrix%*%as.matrix(betag)
+  residuals[,2]<-y-predmatrix%*%as.matrix(betal) 
+  object<-list(beta=rbind(betag,betal),residuals=residuals,
+               message=fit$message) 
+  class(object)<-"AFT" 
+  object}
+lss<-function(formula, data, subset, maxiter=50, 
+              tolerance=0.001, na.action=na.exclude)
+{
+  set.seed(1)
+  eps <- .Machine$double.eps^(2/3)
+  
+  call <- match.call()
+  mf <- match.call(expand.dots = FALSE)
+  m <- match(c("formula", "data", "subset", "na.action"), names(mf), 0)
+  mf <- mf[c(1, m)]
+  mf$drop.unused.levels <- TRUE
+  mf[[1]] <- as.name("model.frame")
+  mf <- eval(mf, sys.parent())
+  Terms <- attr(mf, "terms")
+  xvars <- as.character(attr(Terms, "variables"))
+  yvar <- attr(Terms, "response")
+  if((yvar <- attr(Terms, "response")) > 0)
+    xvars <- xvars[ - yvar]
+  else xlevels <- NULL
+  y <- model.extract(mf, response)
+  x <- model.matrix(Terms, mf)
+  x <- as.matrix(x)
+  
+  if(all(x[, 1] == 1))
+    x <- x[, -1]	
+   
+  if(ncol(as.matrix(y)) != 2)
+    stop("Response must be a right-censored survival object!")
+  
+  nobs <- nrow(y)
+  if(is.vector(x))
+    nvar <- 1
+  else
+    nvar <- ncol(x)
+   
+  zdummy <- matrix(rep(1,nobs), ncol=1)
+  
+  beta <- lss.betag(x, y[,1], y[,2], zdummy)
+  
+   niter=0
+  if(is.vector(x))
+    xbar <- mean(x)
+  else
+    xbar <- apply(x, 2, mean)
+  xm <- x - rep(xbar, rep(nobs, nvar))
+  xinv <- solve(t(xm) %*% xm)
+  
+  while(niter < maxiter)
+  {
+    niter <- niter + 1
+    betaprev <- beta
+    
+    e <- y[,1] - x %*% beta
+    eres <- lss.eres(e, zdummy, y[,2], eps)
+    yhat <- y[,2] * y[,1] + (1 - y[,2]) * (eres + x %*% beta)
+    ybar <- mean(yhat)
+    beta <- xinv %*% (t(xm) %*% (yhat - ybar))
+    
+    bb <- abs(beta)
+    bb[bb<0.01] <- 0.01
+    mm <- max(abs(beta - betaprev) / bb)
+    if(mm < tolerance)
+    {
+      break
+    }
+  }
+  object <- list(beta=beta, ybar=ybar)
+object
+  
+}
+"lss.eres" <- function(e,z,delta,eps,sh=FALSE)
+{
+  nobs=length(e)
+  ord <- order(e)
+  ei <- e[ord]
+  zi <- z[ord]
+  deltai <- delta[ord]
+  tie <- c(diff(ei)>eps,1)
+  tie1 <- c(1,diff(ei)>eps)
+  dummy <- 1:nobs
+  repeats <- diff(c(dummy[c(TRUE,diff(ei)>eps)],nobs+1))
+  Ni <- rev(cumsum(rev(zi)))
+  di=cumsum(zi*deltai)
+  di=di[tie>eps]
+  di=c(di[1],diff(di))
+  ieb <- 1 - di / Ni[tie1>eps]
+  Shat <- cumprod(ieb)
+  if(sh)
+  {
+    return(Shat)	
+  }
+  Shat <- rep(Shat,repeats)
+  edif <- c(diff(ei),0)
+  ehat <- rev(cumsum(rev(edif * Shat)))
+  ehat[Shat<eps] <- 0
+  Shat[Shat<eps] <- 1
+  ehat <- ehat/Shat + ei
+  eres <- ehat
+  eres[dummy[ord]] <- ehat
+  eres
+}
+
+"lss.betag" <-function(x,y,delta,z)
+{
+  if(is.vector(x))
+    row=1
+  else
+    row=ncol(x)
+  col=ncol(z)
+  
+  
+  betagm<-matrix(0,ncol=col,nrow=row)
+  
+  ynew<-1000*(length(y))^2
+  if(is.vector(x))
+  {
+    n1<-length(x)
+    n2<- 1
+  }
+  else
+  {
+    dimnum<-dim(x)
+    n1<-dimnum[1]
+    n2<-dimnum[2]
+  }
+  
+  yy0<-rep(y,rep(n1,n1))
+  delta1<-rep(delta,rep(n1,n1))
+  yy1<-rep(y,n1)
+  yy2<-delta1*(yy0-yy1)
+  
+  xx0<-matrix(rep(as.vector(x),rep(n1,n1*n2)),nrow=n1*n1)
+  xx1<-t(matrix(rep(as.vector(t(x)),n1),nrow=n2))
+  xx2<-xx0-xx1
+  
+  for(i in 1:col)
+  {
+    zz=rep(z[,i],rep(n1,n1))*rep(z[,i],n1)
+    xxdif<-xx2*zz*delta1
+    xnew<-apply(xxdif,2,sum)
+    xnew<-rbind(xxdif,-xnew)
+    yynew<-c(yy2*zz,ynew)
+    
+    if(is.na(LETTERS[c(NA,2)][1])) # if running in R
+      fit <- rq(yynew ~ xnew - 1, tau = 0.5)
+    else
+      fit <- l1fit(xnew, yynew, intercept=FALSE)
+    betagm[,i] <- fit$coef
+    
+  }
+  
+  betagm
+}
+#------------------------
+# User-defined functions 
+#------------------------
+
+#---------------------------
+#estimate variance function
+#---------------------------
+VarF <- function(Y, Delta, Zeta, M, W, par, sdF1, sdF2, bw, sigma1, sigma2){
+  n <- length(Y)
+  k <- ncol(M)  # M, W = data matrix, Delta = censoring indicator, Y = observed survival time
+  l <- 2 * k
+  l <- ncol(W)
+  i <- k + 1
+  v <- k + l
+  beta <- par[1:k]
+  eta <- par[i:v]
+  #sigma1 <- par[v + 1]
+  #sigma2 <- par[v + 2]
+  rho <- par[v + 1]
+  
+  muY <- M %*% beta
+  muC <- W %*% eta
+  ## 1. calculate E(Y|c, Y>C)=eY and E(C|Y, C>Y)=eC
+  aY <- (Y - M %*% beta)/(sigma1*sdF1)
+  aC <- (Y - W %*% eta)/(sigma2*sdF2)
+   meanYcon <- rho*sigma1/sigma2*aC
+  sdYcon <- sigma1*sqrt(1-rho^2)
+  eeY <- etruncnorm(a=aY,b=Inf,mean=meanYcon, sd=sdYcon)
+  veY <- vtruncnorm(a=aY,b=Inf,mean=meanYcon, sd=sdYcon)
+    veY[is.na(veY)] <- 0
+veY[veY>1] <- 0
+veY[veY>0.5] <- 0.5
+
+    
+  meanCcon <- rho*sigma2/sigma1*aY
+  sdCcon <- sigma2*sqrt(1-rho^2)
+  eeC <- etruncnorm(a=aC, b=Inf, mean=meanCcon, sd=sdCcon)
+  veC <- vtruncnorm(a=aC, b=Inf, mean=meanCcon, sd=sdCcon)
+    veC[is.na(veC)] <- 0
+veC[veC>1] <- 0
+veC[veC>0.5] <- 0.5
+
+    
+  z1 <- (Y - (M %*% beta))/(sigma1*sdF1)
+  z3 <- (Y - (W %*% eta))/(sigma2*sdF2)
+eYCout <- sapply(1:n, function(ii){ 
+	tmout <-mtmvnorm(mean=c(0, 0), matrix(c(1,rho,rho,1),ncol=2), lower=c(z1[ii],z3[ii]), upper=c(Inf, Inf))
+    eYC <- tmout$tmean
+    vYC <- tmout$tvar[c(1,4)]
+c(eYC, vYC)})
+  #eYC <- sapply(1:n, function(ii) mtmvnorm(mean=c(0, 0), matrix(c(1,rho,rho,1),ncol=2), lower=c(z1[ii],z3[ii]), upper=c(Inf, Inf))$tmean)
+eYC <- eYCout[1:2,]
+vYC <- eYCout[3:4,]
+vYC[is.na(vYC)] <- 0
+vYC[vYC>1] <- 0
+vYC[vYC>0.5] <- 0.5
+
+  eY <- (Delta*aY + Zeta*eeY + (1-Delta)*(1-Zeta)*eYC[1,])*sigma1*sdF1
+  print(mean(eY))
+  eC <- (Zeta*aC + (Delta)*eeC + (1-Delta)*(1-Zeta)*eYC[2,])*sigma2*sdF2
+  print(mean(eC))
+
+  
+if(anyNA(eY) | anyNA(eC)){
+  sdF1 <- 1
+  sdF2 <- 1}
+else{ 
+
+eYadj <- (Delta*aY + Zeta*eeY/sqrt(1-veY) + (1-Delta)*(1-Zeta)*eYC[1,]/sqrt(1-vYC[1,]))*sigma1*sdF1
+    eCadj <- (Zeta*aC + (Delta)*eeC/sqrt(1-veC) + (1-Delta)*(1-Zeta)*eYC[2,]/sqrt(1-vYC[2,]))*sigma2*sdF2
+
+Yvarall <- locPolSmootherC(muY, (eYadj-mean(eY))^2, muY, bw, 1, EpaK)$beta0
+  Cvarall <- locPolSmootherC(muC, (eCadj-mean(eC))^2, muC, bw, 1, EpaK)$beta0 
+  
+  Yvarall[Yvarall<0.01|is.na(Yvarall)] <- 0.01
+  Cvarall[Cvarall<0.01|is.na(Cvarall)] <- 0.01
+  
+  sdF1 <- sqrt(Yvarall)
+  sdF2 <- sqrt(Cvarall)
+
+  sdF1obs <- (eYadj-mean(eY))^2
+  sdF2obs <- (eCadj-mean(eC))^2
+}
+  object <- list(sdF1=sdF1, sdF2=sdF2, sdF1obs=sdF1obs, sdF2obs=sdF2obs)
+  object
+  
+}
+
+ 
+GEEdep <- function(initall, init, Y, Delta,Zeta, M, W, bw, maxstep){
+  
+  step <- 0
+  parnew <- init
+  parold <- init+100
+  sigma1 <- sigma2 <- 1
+###
+sdF1=sdF2=1 
+
+  while(max(abs(parnew-parold))>0.005 & step<maxstep){
+    print(c('step',step))
+
+    step <- step + 1
+    parold <- parnew
+
+###
+    parnew <- nloptr(x0 = parnew, eval_f = LikH, Y = Y, Delta = Delta, Zeta=Zeta, M = M, sdF1=sdF1, sdF2=sdF2, sigma1=sigma1, sigma2=sigma2, W = W, lb = c(-Inf, -Inf, -Inf, -Inf, -Inf, -Inf, -Inf, -Inf, -Inf, -Inf, -Inf,-Inf, -Inf,-Inf, -1), ub = c(Inf, Inf, Inf, Inf, Inf, Inf, Inf, Inf, Inf, Inf, Inf,Inf, Inf,Inf,1), eval_g_ineq = NULL, opts = list(algorithm = "NLOPT_LN_BOBYQA", ftol_abs = 1e-6, maxeval = 1e+05, xtol_abs = rep(1e-6)))$solution
+
+    print(parnew)
+if(parnew[15]>0.99){parnew[15] <- 0.99}
+if(parnew[15]<(-0.99)){parnew[15] <- -0.99}
+print(c('parnew-parold',max(abs(parnew-parold))))
+    sdF <- VarF(Y, Delta, Zeta, M, W, parnew, sdF1, sdF2,bw, sigma1, sigma2)
+    sdF1 <- sdF$sdF1
+    sdF2 <- sdF$sdF2
+    sdF1obs <- sdF$sdF1obs
+    sdF2obs <- sdF$sdF2obs}
+object <- list(parnew=parnew, sdF1=sdF1, sdF2=sdF2, sdF1obs=sdF1obs, sdF2obs=sdF2obs)
+  object
+}
+
+#---------------------
+#Likelihood functions 
+#---------------------
+LikF <- function(par, Y, Delta, Zeta, M, W) {
+    
+    k <- ncol(M)  # M, W = data matrix, Delta = censoring indicator, Y = observed survival time
+    l <- ncol(W)
+    i <- k + 1
+    v <- k + l
+
+    beta <- par[1:k]
+    eta <- par[i:v]
+    sigma1 <- par[v + 1]
+    sigma2 <- par[v + 2]
+    rho <- par[v + 3]
+
+    transY  <- Y
+    DtransY <- 1
+    n <- length(Y)
+    z1 <- (transY - (M %*% beta))/sigma1
+    z2 <- ((1 - rho * sigma2/sigma1) * transY - (W %*% eta - rho * (sigma2/sigma1) * 
+        M %*% beta))/(sigma2 * (1 - rho^2)^0.5)
+    z3 <- (transY - (W %*% eta))/sigma2
+    z4 <- ((1 - rho * sigma1/sigma2) * transY - (M %*% beta - rho * (sigma1/sigma2) * 
+        W %*% eta))/(sigma1 * (1 - rho^2)^0.5)
+    lowtail <- rep(0,n)
+    
+    nA <- n-sum(Delta+Zeta)
+    z1A <- z1[(Delta+Zeta)==0]
+    z3A <- z3[(Delta+Zeta)==0]
+    lowtailA <- sapply(1:nA, function(j) pmvnorm(mean=c(0, 0), matrix(c(1,rho,rho,1),ncol=2), lower=c(-Inf, -Inf), upper=c(z1A[j],z3A[j])))
+    lowtail[(Delta+Zeta)==0] <- lowtailA
+    
+    z5 <- 1-pnorm(z1)-pnorm(z3)+lowtail
+    
+    tot <- (1/(sigma1) * dnorm(z1) * (1 - pnorm(z2)))^Delta * (1/(sigma2) * dnorm(z3) * 
+                                            (1 - pnorm(z4)))^Zeta * DtransY * z5^((1-Delta)*(1-Zeta))
+    p1 <- pmax(tot, 1e-100)
+    Logn <- sum(log(p1))
+    return(-Logn)
+}
+
+# Likelihood for heter model
+LikH <- function(par, Y, Delta, Zeta, M, W, sdF1, sdF2, sigma1, sigma2){
+  
+  k <- ncol(M)  # M, W = data matrix, Delta = censoring indicator, Y = observed survival time
+  l <- 2 * k
+  l <- ncol(W)
+  i <- k + 1
+  v <- k + l
+  beta <- par[1:k]
+  eta <- par[i:v]
+  rho <- par[v + 1]
+
+  transY  <- Y
+  DtransY <- 1
+  n <- length(Y)
+  z1 <- (transY - (M %*% beta))/(sigma1*sdF1)
+  z2 <- ((1 - rho * sigma2/sigma1*sdF2/sdF1) * transY - (W %*% eta - rho * (sigma2/sigma1) * (sdF2/sdF1)* 
+                                                           M %*% beta))/(sigma2*sdF2 * (1 - rho^2)^0.5)
+  z3 <- (transY - (W %*% eta))/(sigma2*sdF2)
+  z4 <- ((1 - rho * sigma1/sigma2 * sdF1/sdF2) * transY - (M %*% beta - rho * (sigma1/sigma2) * (sdF1/sdF2)*
+                                                             W %*% eta))/(sigma1*sdF1 * (1 - rho^2)^0.5)
+  lowtail <- rep(0,n)
+  nA <- n-sum(Delta+Zeta)
+if(nA==0){tot <- (1/(sigma1*sdY) * dnorm(z1) * (1 - pnorm(z2)))^Delta * (1/(sigma2*sdC) * dnorm(z3) * (1 - pnorm(z4)))^Zeta * DtransY }
+else{
+  z1A <- z1[(Delta+Zeta)==0]
+  z3A <- z3[(Delta+Zeta)==0]
+  lowtailA <- sapply(1:nA, function(j) pmvnorm(mean=c(0, 0), matrix(c(1,rho,rho,1),ncol=2), lower=c(-Inf, -Inf), upper=c(z1A[j],z3A[j])))
+  lowtail[(Delta+Zeta)==0] <- lowtailA
+
+  z5 <- 1-pnorm(z1)-pnorm(z3)+lowtail
+  tot <- (1/(sigma1*sdF1) * dnorm(z1) * (1 - pnorm(z2)))^Delta * (1/(sigma2*sdF2) * dnorm(z3) * (1 - pnorm(z4)))^Zeta * DtransY * z5^((1-Delta)*(1-Zeta))
+}
+  p1 <- pmax(tot, 1e-100)
+  Logn <- sum(log(p1))
+  return(-Logn)
+}
+
+
+
+
