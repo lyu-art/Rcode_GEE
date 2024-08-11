@@ -6,6 +6,7 @@ library(survival)
 library(pbivnorm)
 library(optimr)
 library(numDeriv)
+library(nloptr)
 library(matrixcalc)
 library(ROOPSD)
 library(locpol)
@@ -389,6 +390,7 @@ object
 #estimate variance function
 #---------------------------
 VarF <- function(Y, Delta, Zeta, M, W, par, sdF1, sdF2, bw, sigma1, sigma2){
+  n <- length(Y)
   k <- ncol(M)  # M, W = data matrix, Delta = censoring indicator, Y = observed survival time
   l <- 2 * k
   l <- ncol(W)
@@ -452,11 +454,7 @@ eYadj <- (Delta*aY + Zeta*eeY/sqrt(1-veY) + (1-Delta)*(1-Zeta)*eYC[1,]/sqrt(1-vY
     eCadj <- (Zeta*aC + (Delta)*eeC/sqrt(1-veC) + (1-Delta)*(1-Zeta)*eYC[2,]/sqrt(1-vYC[2,]))*sigma2*sdF2
 
 Yvarall <- locPolSmootherC(muY, (eYadj-mean(eY))^2, muY, bw, 1, EpaK)$beta0
-  Cvarall <- locPolSmootherC(muC, (eCadj-mean(eC))^2, muC, bw, 1, EpaK)$beta0
- 
-  #Yvarall <- locPolSmootherC(muY, (eY-mean(eY))^2, muY, bw, 1, EpaK)$beta0
-  #Cvarall <- locPolSmootherC(muC, (eC-mean(eC))^2, muC, bw, 1, EpaK)$beta0
-  
+  Cvarall <- locPolSmootherC(muC, (eCadj-mean(eC))^2, muC, bw, 1, EpaK)$beta0 
   
   Yvarall[Yvarall<0.01|is.na(Yvarall)] <- 0.01
   Cvarall[Cvarall<0.01|is.na(Cvarall)] <- 0.01
@@ -473,7 +471,7 @@ Yvarall <- locPolSmootherC(muY, (eYadj-mean(eY))^2, muY, bw, 1, EpaK)$beta0
 }
 
  
-GEEdep <- function(initall, init, Y, Delta,Zeta, M, W, bw){
+GEEdep <- function(initall, init, Y, Delta,Zeta, M, W, bw, maxstep){
   
   step <- 0
   parnew <- init
@@ -522,6 +520,7 @@ LikF <- function(par, Y, Delta, Zeta, M, W) {
 
     transY  <- Y
     DtransY <- 1
+    n <- length(Y)
     z1 <- (transY - (M %*% beta))/sigma1
     z2 <- ((1 - rho * sigma2/sigma1) * transY - (W %*% eta - rho * (sigma2/sigma1) * 
         M %*% beta))/(sigma2 * (1 - rho^2)^0.5)
@@ -559,6 +558,7 @@ LikH <- function(par, Y, Delta, Zeta, M, W, sdF1, sdF2, sigma1, sigma2){
 
   transY  <- Y
   DtransY <- 1
+  n <- length(Y)
   z1 <- (transY - (M %*% beta))/(sigma1*sdF1)
   z2 <- ((1 - rho * sigma2/sigma1*sdF2/sdF1) * transY - (W %*% eta - rho * (sigma2/sigma1) * (sdF2/sdF1)* 
                                                            M %*% beta))/(sigma2*sdF2 * (1 - rho^2)^0.5)
@@ -581,56 +581,13 @@ else{
   Logn <- sum(log(p1))
   return(-Logn)
 }
-# Likelihood function under independent censoring model
-
-LikI <- function(par, Y, Delta, Zeta, M, W) {
-  k <- ncol(M)  # M, W = data matrix, Delta = censoring indicator, Y = observed survival time
-  l <- 2 * k
-  l <- ncol(W)
-  i <- k + 1
-  v <- k + l
-  beta <- par[1:k]
-  eta <- par[i:v]
-  sigma1 <- par[v + 1]
-  sigma2 <- par[v + 2]
-  rho <- par[v + 3]
-  transY <- Y
-  DtransY <- 1
-  z1 <- (transY - (M %*% beta))/sigma1
-  z2 <- (transY - (W %*% eta))/sigma2
-  tot <- ((1/sigma1) * dnorm(z1) * (1 - pnorm(z2)))^(Delta*(1-Zeta)) * ((1/sigma2) * dnorm(z2) * 
-                                                               (1 - pnorm(z1)))^((1 - Delta)*Zeta) *DtransY * (1-pnorm(z1)*(1-pnorm(z2)))^((1-Delta)*(1-Zeta))
-  p1 <- pmax(tot, 1e-100)
-  Logn <- sum(log(p1))
-  return(-Logn)
-}
-################################################ read in prostate cancer data
-a=read.table("C:\\Users\\lyu\\Google Drive\\yulili\\papers\\survival\\dependent_censoring\\supp_parametric_biometrical_2020\\GEE_surival_mine\\dataset\\prostate.dat", header=F)
-a <- a[a[,10]>5,]
-time <- log(a[,10])
-Delta <- as.numeric(a[,11]==1)
-adm <- as.numeric(a[,11]==0)
-Zeta <- 1- Delta-adm
-
-rx <- a[,6]
-rx[rx==1|rx==2] <-0
-rx[rx==3|rx==4] <-1
-
-#########reduce covariate
-x <- cbind(1,a[,12],a[,19], rx,a[,15],a[,20],a[,21])
-datafinal <- cbind(time, Delta, Zeta, x)
-datafinal[datafinal==-9999] <- NA
-datause<-na.omit(datafinal)
-time <- datause[,1]
-Delta <- datause[,2]
-Zeta <- datause[,3]
-M<- datause[,4:10]
-W <- datause[,4:10]
-############################
+#############################################################################################
+main <- function(time, Delta, Zeta, M, W){
 Y <- time
+datause <- cbind(time, Delta, Zeta, M, W)
 init1 <- lss(cbind(Y,Delta)~M[,-1])
 init2 <- lss(cbind(Y,Zeta)~W[,-1])
-n <- dim(datause)[1]
+n <- length(time)
 bw<-n^(-1/5)
 maxstep <- 50
 
@@ -638,9 +595,12 @@ initall <- c(init1$ybar, init1$beta, init2$ybar, init2$beta, 1,1,0.5)
 
 init <- initall
 initial <- initall
+ncov <- length(initall)
+nM <- dim(M)[2]
+nW <- dim(W)[2]
 
   ### Fitting GEE method
-  parhat2 <- GEEdep(initall, initall[-(15:16)], Y, Delta,Zeta, M, W, bw)
+  parhat2 <- GEEdep(initall, initall[-((ncov-2):(ncov-1))], Y, Delta,Zeta, M, W, bw, maxstep)
   parhatGEE <- parhat2$parnew
   sdY <- parhat2$sdF1
   sdC <- parhat2$sdF2
@@ -651,10 +611,10 @@ initial <- initall
   print('parhatGEE')
   print(parhatGEE)
 
-##########################################################################################################
+################
   ### bootstrap
-  nboot <- 50
-  A.boot <- matrix(0,nrow=nboot,ncol=15)
+  nboot <- 2
+  A.boot <- matrix(0,nrow=nboot,ncol=ncov-2)
   for(ii in 1:nboot){
     print('boot')
     print(ii)
@@ -662,15 +622,22 @@ initial <- initall
     position<-floor(runif(n,0,1)*n)+1	
     newdata<-datause[position,]
 ###
-    parhat2.boot<-GEEdep(initall, initall[-(15:16)], newdata[,1],newdata[,2],newdata[,3],newdata[,4:10],newdata[,4:10],bw)
+    parhat2.boot<-GEEdep(initall, initall[-((ncov-2):(ncov-1))], newdata[,1],newdata[,2],newdata[,3],newdata[,4:(4+nM-1)],newdata[,(4+nM):(4+nM+nW-1)],bw, maxstep)
     A.boot[ii,]<-c(parhat2.boot$parnew)
 }
   
   B.boot<-sqrt(apply(A.boot,2,var))
+object <- list(parhatGEE=parhatGEE, B.boot=B.boot)
+object
+}
 
+########################################################################################### 
+##M (covariate for survival time) and W (covariates for censoring time) include column 1. Timis is the ##survival time, Delta=1 when survival time is observed, Zeta=1 when censoring time is observed.
+############################################################################################
+## the main function is used to analyze the data. 
   
-B.boot
-parhatGEE
+result <- main(time, Delta, Zeta, M, W)
+
 
 
 
